@@ -1,0 +1,83 @@
+name: build cli
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # to create/upload the Release on tags
+
+jobs:
+  cli:
+    runs-on: macos-14 # Apple Silicon runner; ships a Swift toolchain
+    env:
+      # Developer ID *Application* cert (signs the CLI with the hardened runtime).
+      # Optional: without it the binary is ad-hoc signed — fine for `swift run` /
+      # local use, and Homebrew doesn't quarantine tap downloads, but a Developer
+      # ID signature avoids any Gatekeeper friction on other machines.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Import the Developer ID Application cert into a throwaway keychain (skipped
+      # if the secret isn't set — the build then ad-hoc signs).
+      - name: Import signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/veilens.keychain-db"
+          KPW="$(openssl rand -hex 16)"
+          security create-keychain -p "$KPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPW" "$KEYCHAIN"
+          f="$RUNNER_TEMP/c.p12"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$f"
+          security import "$f" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          rm -f "$f"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KPW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          APP_ID="$(security find-identity -v "$KEYCHAIN" | awk '/Developer ID Application/{print $2; exit}')"
+          echo "VEILENS_SIGN_IDENTITY=$APP_ID" >> "$GITHUB_ENV"
+          echo "VEILENS_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "imported app=${APP_ID:-<none>}"
+
+      - name: Build veilens CLI (universal, signed)
+        run: |
+          swift build -c release --arch arm64 --arch x86_64 --product veilens
+          BIN="$(swift build -c release --arch arm64 --arch x86_64 --product veilens --show-bin-path)/veilens"
+          [ -x "$BIN" ] || { echo "::error::CLI binary not found at $BIN"; exit 1; }
+          STAGE="$RUNNER_TEMP/veilens-cli"; mkdir -p "$STAGE"
+          cp "$BIN" "$STAGE/veilens"
+          if [ -n "${VEILENS_SIGN_IDENTITY:-}" ]; then
+            codesign --force --options runtime --timestamp --sign "$VEILENS_SIGN_IDENTITY" "$STAGE/veilens"
+          else
+            echo "==> ad-hoc signing CLI (no Developer ID identity)"; codesign --force --sign - "$STAGE/veilens" || true
+          fi
+          codesign --verify --verbose "$STAGE/veilens" || true
+          tar -C "$STAGE" -czf "$GITHUB_WORKSPACE/veilens-macos.tar.gz" veilens
+          echo "veilens-macos.tar.gz sha256:"; shasum -a 256 "$GITHUB_WORKSPACE/veilens-macos.tar.gz"
+
+      - name: Clean up keychain
+        if: always() && env.VEILENS_KEYCHAIN != ''
+        run: security delete-keychain "$VEILENS_KEYCHAIN" || true
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: veilens-cli
+          path: veilens-macos.tar.gz
+          if-no-files-found: error
+
+      # On a version tag (e.g. v0.1.0), publish a Release with the CLI tarball.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: veilens-macos.tar.gz
+          body: |
+            The `veilens` CLI — the personal data vault on Apple Silicon.
+
+            **Install:** `brew install veilensapp/tap/veilens`, then `veilens install`.
