@@ -15,7 +15,7 @@ struct Veilens: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "veilens",
         abstract: "The veilens personal data vault — install, start, stop, index, and ask.",
-        subcommands: [Install.self, Start.self, Stop.self, Status.self, Index.self, Ask.self]
+        subcommands: [Install.self, Update.self, Start.self, Stop.self, Status.self, Index.self, Ask.self]
     )
 }
 
@@ -32,6 +32,27 @@ struct Install: AsyncParsableCommand {
         let boot = streaming()
         try await boot.installVault()
         print("✓ veilens installed (inference server + headgate + veilens site)")
+    }
+}
+
+// ── veilens update ─────────────────────────────────────────────────────────────
+struct Update: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Update veilens and its components to the latest release.",
+        discussion: """
+        Upgrades the `veilens` CLI via Homebrew, then refreshes the downloadable \
+        components (inference-server engine, headgate, veilens engine) to their \
+        latest releases. The Mojo toolchains and the model weights are kept, so it \
+        only re-fetches + rebuilds the source bundles. Progress is logged to \
+        ~/Library/Logs/Veilens/<date>.log.
+        """)
+    @Flag(name: .long, help: "Refresh the components only; don't upgrade the CLI via Homebrew.")
+    var skipCli = false
+
+    @MainActor func run() async throws {
+        let boot = streaming()
+        try await boot.selfUpdate(updateCLI: !skipCli)
+        print("✓ veilens up to date")
     }
 }
 
@@ -93,13 +114,10 @@ struct Index: AsyncParsableCommand {
 
     @MainActor func run() async throws {
         let boot = Bootstrapper()
-        let script = try boot.writeVeilensScript()
-        // exec the veilens launcher with `index <folder>`.
-        let argv: [UnsafeMutablePointer<CChar>?] =
-            [strdup("/bin/bash"), strdup(script.path), strdup("index"), strdup(folder), nil]
-        execv("/bin/bash", argv)
-        throw BootstrapError.step("veilens index",
-                                  "exec /bin/bash failed: \(String(cString: strerror(errno)))")
+        // Run the veilens launcher (`index <folder>`) as a logged child so its
+        // output — and any failure — is captured in the veilens log.
+        let code = try boot.runVaultIndex(folder: folder)
+        try finish(code, boot, "veilens index")
     }
 }
 
@@ -123,16 +141,21 @@ struct Ask: AsyncParsableCommand {
         let boot = Bootstrapper()
         let q = question.joined(separator: " ")
         let dir = boot.ensureVaultDir()
-        // Run the headgate vault loop via the headgate launcher: it execs
-        // `./build/headgate "$@"`, so pass `vault "<q>" <dir>`.
-        let script = try boot.writeHeadgateScript()
-        let argv: [UnsafeMutablePointer<CChar>?] =
-            [strdup("/bin/bash"), strdup(script.path),
-             strdup("vault"), strdup(q), strdup(dir), nil]
-        execv("/bin/bash", argv)
-        throw BootstrapError.step("veilens ask",
-                                  "exec /bin/bash failed: \(String(cString: strerror(errno)))")
+        // Run the headgate vault loop (`vault "<q>" <dir>`) as a logged child so its
+        // output — and any spawn failure inside headgate — is captured.
+        let code = try boot.runVaultAsk(question: q, vaultDir: dir)
+        try finish(code, boot, "veilens ask")
     }
+}
+
+/// Map a child's exit status to the CLI's: on failure, point at the diagnostic
+/// log, then propagate the same code via ArgumentParser's ExitCode.
+@MainActor private func finish(_ code: Int32, _ boot: Bootstrapper, _ what: String) throws {
+    if code != 0 {
+        FileHandle.standardError.write(Data(
+            "\n\(what) failed (exit \(code)). Diagnostics: \(boot.veilensLogURL.path)\n".utf8))
+    }
+    throw ExitCode(code)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

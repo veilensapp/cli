@@ -243,6 +243,43 @@ public final class Bootstrapper: ObservableObject {
         NSWorkspace.shared.open(ensureLog())
     }
 
+    // ── veilens diagnostic log (~/Library/Logs/Veilens/<date>.log) ──────────────
+    // Separate from Millrace.log: a per-day, user-facing diagnostic log for the
+    // `veilens` CLI itself (the ask/index runs + update), in the conventional
+    // macOS ~/Library/Logs location so it's easy to find and attach to a report.
+    public var veilensLogDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/Veilens", isDirectory: true)
+    }
+    /// Today's log file, e.g. ~/Library/Logs/Veilens/2026-06-17.log.
+    public var veilensLogURL: URL {
+        veilensLogDir.appendingPathComponent("\(Self.day()).log")
+    }
+
+    @discardableResult
+    private func ensureVeilensLog() -> URL {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: veilensLogDir, withIntermediateDirectories: true)
+        if !fm.fileExists(atPath: veilensLogURL.path) {
+            fm.createFile(atPath: veilensLogURL.path, contents: nil)
+        }
+        return veilensLogURL
+    }
+
+    /// Append a line to today's veilens log (best-effort; never throws).
+    public func vlog(_ text: String) {
+        ensureVeilensLog()
+        guard let fh = try? FileHandle(forWritingTo: veilensLogURL) else { return }
+        defer { try? fh.close() }
+        fh.seekToEndOfFile()
+        if let d = (text + "\n").data(using: .utf8) { fh.write(d) }
+    }
+
+    private static func day() -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date())
+    }
+
     // ── step 1: install server (+ weights) ──────────────────────────────────────
     /// Menu-app entry point: fire-and-forget, drives `phase`. The CLI calls the
     /// throwing `installServer()` directly.
@@ -1097,6 +1134,157 @@ public final class Bootstrapper: ObservableObject {
         _ = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return p.terminationStatus
+    }
+
+    // ── diagnosable one-shot runs (ask / index) ────────────────────────────────
+    // The `ask` and `index` subcommands used to execv /bin/bash, which REPLACES
+    // this process — so a failure inside the child (e.g. headgate's `posix_spawn`
+    // of the mojo compiler failing with ENOENT) left nothing to log. These run the
+    // launcher as a child instead, mirroring its combined stdout/stderr to both the
+    // terminal and the veilens log, after dumping the launcher + the paths it
+    // depends on. Returns the child's exit status (caller maps it to the CLI exit).
+
+    /// Run the headgate vault loop for one question. See runLoggedScript.
+    public func runVaultAsk(question: String, vaultDir: String) throws -> Int32 {
+        refreshServerRunning()
+        let script = try writeHeadgateScript()
+        let args = ["vault", question, vaultDir]
+        logRunDiagnostics(label: "ask", launcher: script, args: args, probes: [
+            ("headgate launcher", script.path),
+            ("headgate dir (cwd)", headgateDir.path),
+            ("headgate binary", headgateBin.path),
+            ("mojo compiler (headgate shells it)", headgateMojoPrefix.appendingPathComponent("bin/mojo").path),
+            ("veilens vault tools (src)", veilensDir.appendingPathComponent("src/vault.mojo").path),
+            ("vault dir", vaultDir),
+        ])
+        return try runLoggedScript(script.path, args, label: "ask")
+    }
+
+    /// Run the veilens engine `index <folder>`. See runLoggedScript.
+    public func runVaultIndex(folder: String) throws -> Int32 {
+        refreshServerRunning()
+        let script = try writeVeilensScript()
+        let args = ["index", folder]
+        logRunDiagnostics(label: "index", launcher: script, args: args, probes: [
+            ("veilens launcher", script.path),
+            ("veilens dir (cwd)", veilensDir.path),
+            ("veilens binary", veilensBin.path),
+            ("mojo compiler", veilensMojoPrefix.appendingPathComponent("bin/mojo").path),
+            ("folder", folder),
+        ])
+        return try runLoggedScript(script.path, args, label: "index")
+    }
+
+    /// Dump everything useful for diagnosing a spawn failure: the exact command,
+    /// whether each dependency path exists (and is executable), the launcher's
+    /// contents (which set PATH/CONDA_PREFIX/MODULAR_HOME), and the inherited PATH.
+    private func logRunDiagnostics(label: String, launcher: URL, args: [String], probes: [(String, String)]) {
+        let fm = FileManager.default
+        vlog("\n===== veilens \(label) — \(Self.stamp()) =====")
+        vlog("command: /bin/bash \(launcher.path) \(args.joined(separator: " "))")
+        vlog("server running: \(serverRunning)")
+        vlog("paths:")
+        for (name, path) in probes {
+            let tag = !fm.fileExists(atPath: path) ? "MISSING"
+                    : fm.isExecutableFile(atPath: path) ? "exec" : "ok"
+            vlog("  [\(tag)] \(name): \(path)")
+        }
+        if let body = try? String(contentsOf: launcher, encoding: .utf8) {
+            vlog("launcher \(launcher.lastPathComponent):")
+            for line in body.split(separator: "\n", omittingEmptySubsequences: false) {
+                vlog("  | \(line)")
+            }
+        }
+        vlog("inherited PATH: \(ProcessInfo.processInfo.environment["PATH"] ?? "(unset)")")
+        vlog("----- child output -----")
+    }
+
+    /// Run `/bin/bash <script> <args…>` as a child, teeing its combined stdout and
+    /// stderr to BOTH this terminal and the veilens log. Streams live (so long runs
+    /// show progress) and returns the exit status without throwing on nonzero.
+    @discardableResult
+    public func runLoggedScript(_ scriptPath: String, _ args: [String], label: String) throws -> Int32 {
+        let logFH = try? FileHandle(forWritingTo: ensureVeilensLog())
+        logFH?.seekToEndOfFile()
+        let out = FileHandle.standardOutput
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [scriptPath] + args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        // standardInput is left inherited, so an interactive child still works.
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            guard !d.isEmpty else { return }
+            out.write(d)
+            logFH?.write(d)
+        }
+        do {
+            try p.run()
+        } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            vlog("[\(label)] failed to launch /bin/bash: \(error)")
+            try? logFH?.close()
+            throw error
+        }
+        p.waitUntilExit()
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let rest = pipe.fileHandleForReading.readDataToEndOfFile()
+        if !rest.isEmpty { out.write(rest); logFH?.write(rest) }
+        let code = p.terminationStatus
+        vlog("[\(label)] exit status: \(code)")
+        try? logFH?.close()
+        return code
+    }
+
+    // ── self-update (CLI + components) ──────────────────────────────────────────
+    /// Update the `veilens` CLI via Homebrew (best-effort), then refresh the
+    /// downloadable components — the inference-server engine, headgate, and the
+    /// veilens engine — to their latest releases. The pinned Mojo toolchains and the
+    /// (multi-GB) model weights are preserved; only the source bundles are re-fetched
+    /// and rebuilt. Progress streams through `onProgress`.
+    public func selfUpdate(updateCLI: Bool = true) async throws {
+        vlog("\n===== veilens update — \(Self.stamp()) =====")
+        if updateCLI { updateHomebrewCLI() }
+
+        set("Refreshing inference-server engine…")
+        try? FileManager.default.removeItem(at: engineRoot)   // drop built binary + source (weights/toolchain kept)
+        try await installServer()
+
+        set("Refreshing headgate…")
+        try? FileManager.default.removeItem(at: headgateRoot)
+        try await installHeadgateEngine()
+
+        set("Refreshing veilens engine…")
+        try? FileManager.default.removeItem(at: veilensRoot)
+        try await installVeilensEngine()
+
+        vlog("update complete")
+    }
+
+    /// Upgrade the CLI via Homebrew if it's installed that way. Best-effort: if brew
+    /// or the formula isn't present, log it and carry on (components still refresh).
+    private func updateHomebrewCLI() {
+        let brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+        guard let brew else {
+            set("• Homebrew not found — skipping CLI self-update")
+            vlog("brew not found at /opt/homebrew or /usr/local; skipped CLI self-update")
+            return
+        }
+        set("Updating the veilens CLI via Homebrew…")
+        _ = try? run(brew, ["update"])   // refresh tap metadata (non-fatal if offline)
+        do {
+            let out = try run(brew, ["upgrade", "veilensapp/tap/veilens"])
+            vlog("brew upgrade:\n\(out)")
+            set("✓ CLI updated (takes effect next run)")
+        } catch {
+            // `brew upgrade` reports nonzero when nothing to do or the formula isn't
+            // installed via brew — neither is fatal to a component refresh.
+            vlog("brew upgrade (non-fatal): \(humanError(error))")
+            set("• CLI not upgraded via Homebrew (already latest, or not a brew install)")
+        }
     }
 
     // ── phase / progress sink ───────────────────────────────────────────────────
