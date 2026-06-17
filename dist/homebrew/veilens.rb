@@ -3,9 +3,9 @@ class Veilens < Formula
   homepage "https://github.com/veilensapp/cli"
   # version / url / sha256 are bumped per release by dist/homebrew/update-formula.sh
   # (downloads the veilens-macos.tar.gz release asset and fills in its checksum).
-  version "0.1.1"
-  url "https://github.com/veilensapp/cli/releases/download/v0.1.1/veilens-macos.tar.gz"
-  sha256 "8209d84833d3499092eddbf5cc3c15d6a5ba727ef525b95fb3a922060401d307"
+  version "0.1.2"
+  url "https://github.com/veilensapp/cli/releases/download/v0.1.2/veilens-macos.tar.gz"
+  sha256 "9eefdc0464e025545a47578b5fbdd5f95ac554956d8875a6af07c324c7690f6a"
 
   depends_on :macos
 
