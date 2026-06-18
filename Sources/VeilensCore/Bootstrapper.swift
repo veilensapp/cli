@@ -301,7 +301,7 @@ public final class Bootstrapper: ObservableObject {
         // skip what's already done (toolchain, weights), so a partial install
         // resumes (e.g. just the missing embedding weights).
         if isServerInstalled && weightsPresent && embedWeightsPresent {
-            set("server already installed — skipping")
+            set("millrace already installed — skipping")
             return
         }
         let fm = FileManager.default
@@ -311,7 +311,7 @@ public final class Bootstrapper: ObservableObject {
         logHeader("Install server")
 
         if !fm.fileExists(atPath: mojoPrefix.appendingPathComponent("bin/mojo").path) {
-            set("Downloading Mojo compiler (~70 MB)…")
+            set("Downloading Mojo compiler for millrace (~70 MB)…")
             let compiler = try await download(mojoCompilerURL, name: "mojo-compiler.conda")
             set("Extracting Mojo…")
             try extractConda(compiler, into: mojoPrefix)
@@ -320,15 +320,15 @@ public final class Bootstrapper: ObservableObject {
         }
         try relocateMojoPrefix(mojoPrefix)   // rewrite modular.cfg's baked placeholder prefix
 
-        set("Downloading engine source…")
+        set("Downloading millrace source…")
         let zip = try await download(serverZipURL, name: "runner.zip")
-        set("Unpacking engine…")
+        set("Unpacking millrace…")
         try unpackZip(zip, into: engineRoot)
 
         set("Locating Python…")
         let python = try findPython()
 
-        set("Building engine (first run, ~1 min)…")
+        set("Building millrace (first run, ~1 min)…")
         try buildBinary(python: python, source: "src/server.mojo",
                         args: ["-I", "../jinja2.mojo/src", "-I", "../flare"], out: "build/server")
         signServerIdentity()
@@ -1253,15 +1253,17 @@ public final class Bootstrapper: ObservableObject {
         vlog("\n===== veilens update — \(Self.stamp()) =====")
         if updateCLI { updateHomebrewCLI() }
 
-        set("Refreshing inference-server engine…")
+        // First reference to each component introduces it with a gloss; the
+        // granular install steps below then use the short product name.
+        set("Refreshing millrace, the inference server…")
         try? FileManager.default.removeItem(at: engineRoot)   // drop built binary + source (weights/toolchain kept)
         try await installServer()
 
-        set("Refreshing headgate…")
+        set("Refreshing headgate, the privacy agent harness…")
         try? FileManager.default.removeItem(at: headgateRoot)
         try await installHeadgateEngine()
 
-        set("Refreshing veilens engine…")
+        set("Refreshing veilens, the vault engine…")
         try? FileManager.default.removeItem(at: veilensRoot)
         try await installVeilensEngine()
 
