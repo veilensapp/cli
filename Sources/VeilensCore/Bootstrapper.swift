@@ -769,6 +769,11 @@ public final class Bootstrapper: ObservableObject {
         export CONDA_PREFIX='\(headgateMojoPrefix.path)'
         export MODULAR_HOME='\(modularHome)'
         export PATH='\(mojoBin)':"$PATH"
+        # The vault path shells `<veilens>/build/veilens manifest`, compiles the
+        # generated program with `-I <veilens>/src` + its vendored siblings, and
+        # reads the ~/.config/veilens index. headgate defaults to the dev sibling
+        # layout (../veilens); point it at the installed veilens checkout instead.
+        export HEADGATE_VEILENS='\(veilensDir.path)'
         # flare's bundled OpenSSL has a CI-baked CA path; point it at the system
         # bundle so HTTPS to the Anthropic API verifies (else CertificateUntrusted).
         [ -f /etc/ssl/cert.pem ] && export SSL_CERT_FILE='/etc/ssl/cert.pem'
