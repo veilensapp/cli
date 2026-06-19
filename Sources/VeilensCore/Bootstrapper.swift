@@ -1139,6 +1139,7 @@ public final class Bootstrapper: ObservableObject {
     public func writeVeilensAppScript(vaultDir dir: String) throws -> URL {
         let mojoBin = headgateMojoPrefix.appendingPathComponent("bin").path
         let modularHome = headgateMojoPrefix.appendingPathComponent("share/max").path
+        let serverLog = veilensLogDir.appendingPathComponent("server.log").path
         let script = support.appendingPathComponent("run-veilens-app.sh")
         let body = """
         #!/bin/bash
@@ -1155,21 +1156,25 @@ public final class Bootstrapper: ObservableObject {
         export VEILENS_LOCAL_URL='http://127.0.0.1:8000/v1'
         # veilens-ws compiles the generated vault program against the veilens sources.
         export HEADGATE_VEILENS='\(veilensDir.path)'
-        # Streaming backend on :10001, static UI on :10000. Kill the WS server when
-        # the foreground static server exits (Ctrl-C ends both).
-        ./build/veilens-ws & WS_PID=$!
-        trap 'kill $WS_PID 2>/dev/null' EXIT
+        # Run both servers detached in the BACKGROUND (no Terminal) — static UI on
+        # :10000, streaming WS on :10001 — logging to the veilens server log. nohup
+        # so they survive this launcher (and the CLI) exiting; `veilens stop` reaps
+        # them. This launcher spawns them and exits immediately.
+        LOG='\(serverLog)'
+        mkdir -p "$(dirname "$LOG")"
+        echo "=== veilens app servers starting $(date) ===" >> "$LOG"
+        nohup ./build/veilens-server >> "$LOG" 2>&1 &
+        nohup ./build/veilens-ws     >> "$LOG" 2>&1 &
         ( sleep 1.5 && open 'http://localhost:10000' ) >/dev/null 2>&1 &
-        ./build/veilens-server
         """
         try body.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
         return script
     }
 
-    /// `millrace veilens start` / menu "Open vault chat…": ensure the combined
-    /// server is running (launchd), then start the vault chat in a new Terminal and
-    /// open http://localhost:10000. The script opens the browser itself.
+    /// `veilens start`: ensure the combined inference server is running (launchd),
+    /// then start the vault app servers in the BACKGROUND (no Terminal) and open
+    /// http://localhost:10000. Server output goes to the veilens server log.
     public func startVaultChat(vaultDir dir: String) async throws {
         // 0. The vault dir must exist before headgate/veilens's `manifest` runs
         //    over it (a clean machine has no vault dir yet).
@@ -1180,15 +1185,40 @@ public final class Bootstrapper: ObservableObject {
             refreshServerRunning()
             if !serverRunning { try startServer() }
         }
-        // 2. Start the vault chat in a new Terminal (it opens :10000). Prefer the
-        //    app server (streaming UI) when installed; else the headgate web UI.
-        let script = isAppServerInstalled
-            ? try writeVeilensAppScript(vaultDir: dir)
-            : try writeVeilensWebScript(vaultDir: dir)
-        let cmd = "'\(script.path)'"
-        try run("/usr/bin/osascript",
-                ["-e", "tell application \"Terminal\" to activate",
-                 "-e", "tell application \"Terminal\" to do script \"\(cmd)\""])
+        // 2. Start the vault chat. With the app server, the launcher spawns both
+        //    servers detached in the background and opens the browser, then exits —
+        //    no Terminal window (clients are web/mobile). Fall back to the legacy
+        //    headgate web UI (still a Terminal) only when the app server is absent.
+        if isAppServerInstalled {
+            let script = try writeVeilensAppScript(vaultDir: dir)
+            try run("/bin/bash", [script.path])
+        } else {
+            let script = try writeVeilensWebScript(vaultDir: dir)
+            let cmd = "'\(script.path)'"
+            try run("/usr/bin/osascript",
+                    ["-e", "tell application \"Terminal\" to activate",
+                     "-e", "tell application \"Terminal\" to do script \"\(cmd)\""])
+        }
+    }
+
+    /// Ensure the combined inference server is running (idempotent). No-op if it
+    /// isn't installed yet — the caller surfaces that downstream. Without this,
+    /// `ask`/the vault loop blocks on a dead model endpoint with no clue why.
+    public func ensureInferenceServer() throws {
+        guard isServerInstalled && weightsPresent else { return }
+        refreshServerRunning()
+        if !serverRunning {
+            set("Starting the inference server (loading model weights can take a bit)…")
+            try startServer()
+        }
+    }
+
+    /// Stop the background app servers (veilens-server + veilens-ws). Returns true
+    /// if at least one was running.
+    public func stopAppServer() -> Bool {
+        let ws = (try? runStatus("/usr/bin/pkill", ["-f", "build/veilens-ws"])) == 0
+        let srv = (try? runStatus("/usr/bin/pkill", ["-f", "build/veilens-server"])) == 0
+        return ws || srv
     }
 
     /// Menu-app entry point: open the vault chat (fire-and-forget).

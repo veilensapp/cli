@@ -59,16 +59,18 @@ struct Update: AsyncParsableCommand {
 // ── veilens start ────────────────────────────────────────────────────────────
 struct Start: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Start everything — the inference server and the veilens site at http://localhost:10000.",
+        abstract: "Start everything — the inference server and the veilens app at http://localhost:10000.",
         discussion: """
-        Ensures the combined inference server is running (launchd), starts the \
-        veilens vault site (headgate web in VAULT mode over your vault dir — \
-        $VEILENS_VAULT, else ~/.config/veilens/vault), and opens http://localhost:10000.
+        Ensures the combined inference server is running (launchd), then starts the \
+        veilens app servers (UI on :10000, streaming on :10001) in the background — \
+        no Terminal — and opens http://localhost:10000. Server logs:
+        ~/Library/Logs/Veilens/server.log.
         """)
     @MainActor func run() async throws {
         let boot = Bootstrapper()
         try await boot.startVaultChat(vaultDir: boot.ensureVaultDir())
-        print("✓ started — veilens site at http://localhost:10000")
+        print("✓ veilens running in the background — http://localhost:10000")
+        print("  logs: \(boot.veilensLogDir.appendingPathComponent("server.log").path)")
     }
 }
 
@@ -82,8 +84,10 @@ struct Stop: AsyncParsableCommand {
         let wasRunning = boot.serverRunning
         try boot.stopServer()
         print(wasRunning ? "✓ inference server stopped" : "• inference server was not running")
-        print(boot.stopHeadgateWeb()
-              ? "✓ veilens site stopped" : "• veilens site was not running")
+        let stoppedApp = boot.stopAppServer()
+        let stoppedWeb = boot.stopHeadgateWeb()
+        print(stoppedApp || stoppedWeb
+              ? "✓ veilens app stopped" : "• veilens app was not running")
     }
 }
 
@@ -139,11 +143,15 @@ struct Ask: AsyncParsableCommand {
         guard !question.isEmpty else {
             throw BootstrapError.step("veilens ask", "no question given")
         }
-        let boot = Bootstrapper()
+        let boot = streaming()   // stream progress to the console
         let q = question.joined(separator: " ")
         let dir = boot.ensureVaultDir()
+        // The vault loop calls the model via the inference server — make sure it's
+        // up, else `ask` blocks on a dead endpoint with no feedback.
+        try boot.ensureInferenceServer()
+        print("Thinking — progress below (first run can take a minute):")
         // Run the headgate vault loop (`vault "<q>" <dir>`) as a logged child so its
-        // output — and any spawn failure inside headgate — is captured.
+        // streamed progress + the answer (and any failure) surface here and in the log.
         let code = try boot.runVaultAsk(question: q, vaultDir: dir)
         try finish(code, boot, "veilens ask")
     }
