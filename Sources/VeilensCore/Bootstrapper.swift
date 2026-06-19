@@ -942,6 +942,43 @@ public final class Bootstrapper: ObservableObject {
         }
     }
 
+    /// The vault program headgate compiles + runs executes under headgate's
+    /// CONDA_PREFIX (headgate-mojo), so the veilens vault FFI shims it dlopens
+    /// (liblancedbmojo / libzlibmojo + their dylib deps) must live in
+    /// headgate-mojo/lib too. Copy the ones headgate lacks from the veilens
+    /// toolchain (same Mojo nightly → ABI-compatible). Best-effort; idempotent.
+    public func linkVaultShims() {
+        let fm = FileManager.default
+        let src = veilensMojoPrefix.appendingPathComponent("lib")
+        let dst = headgateMojoPrefix.appendingPathComponent("lib")
+        guard fm.fileExists(atPath: src.path) else { return }
+        try? fm.createDirectory(at: dst, withIntermediateDirectories: true)
+        for name in (try? fm.contentsOfDirectory(atPath: src.path)) ?? []
+        where name.hasSuffix(".dylib") || name.hasSuffix(".so") {
+            let d = dst.appendingPathComponent(name)
+            if !fm.fileExists(atPath: d.path) {   // don't clobber headgate's own shims
+                try? fm.copyItem(at: src.appendingPathComponent(name), to: d)
+            }
+        }
+    }
+
+    /// A fresh per-ask transcript path: /tmp/veilens/sessions/<timestamp>-<slug>.log.
+    public func newSessionLog(for question: String) -> URL {
+        let dir = URL(fileURLWithPath: "/tmp/veilens/sessions", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = f.string(from: Date())
+        var slug = ""
+        for c in question.lowercased() {
+            slug.append((c.isLetter || c.isNumber) ? c : "-")
+            if slug.count >= 40 { break }
+        }
+        while slug.contains("--") { slug = slug.replacingOccurrences(of: "--", with: "-") }
+        slug = slug.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        if slug.isEmpty { slug = "ask" }
+        return dir.appendingPathComponent("\(stamp)-\(slug).log")
+    }
+
     /// `mojo build` env for the veilens toolchain prefix.
     private func veilensMojoEnv(python: URL) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
@@ -1080,6 +1117,7 @@ public final class Bootstrapper: ObservableObject {
         try await installServer()           // engine + chat + embedding weights
         try await installHeadgateEngine()   // the harness + vault web chat server
         try await installVeilensEngine()    // the vault tools + indexer
+        linkVaultShims()                    // veilens FFI shims → headgate-mojo/lib (vault-run dlopen)
         ensureVaultDir()                    // leave the default vault dir ready
     }
 
@@ -1292,7 +1330,12 @@ public final class Bootstrapper: ObservableObject {
             ("veilens vault tools (src)", veilensDir.appendingPathComponent("src/vault.mojo").path),
             ("vault dir", vaultDir),
         ])
-        return try runLoggedScript(script.path, args, label: "ask")
+        // Per-ask transcript: the CLI names it (timestamp + question slug) and the
+        // headgate orchestrator appends the outside-model prompt + program to it.
+        let session = newSessionLog(for: question)
+        set("session transcript → \(session.path)")
+        return try runLoggedScript(script.path, args, label: "ask",
+                                   env: ["VEILENS_SESSION_LOG": session.path])
     }
 
     /// Run the veilens engine `index <folder>`. See runLoggedScript.
@@ -1338,13 +1381,19 @@ public final class Bootstrapper: ObservableObject {
     /// stderr to BOTH this terminal and the veilens log. Streams live (so long runs
     /// show progress) and returns the exit status without throwing on nonzero.
     @discardableResult
-    public func runLoggedScript(_ scriptPath: String, _ args: [String], label: String) throws -> Int32 {
+    public func runLoggedScript(_ scriptPath: String, _ args: [String], label: String,
+                                env extra: [String: String] = [:]) throws -> Int32 {
         let logFH = try? FileHandle(forWritingTo: ensureVeilensLog())
         logFH?.seekToEndOfFile()
         let out = FileHandle.standardOutput
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = [scriptPath] + args
+        if !extra.isEmpty {
+            var e = ProcessInfo.processInfo.environment
+            for (k, v) in extra { e[k] = v }
+            p.environment = e
+        }
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -1396,6 +1445,7 @@ public final class Bootstrapper: ObservableObject {
         set("Refreshing veilens, the vault engine…")
         try? FileManager.default.removeItem(at: veilensRoot)
         try await installVeilensEngine()
+        linkVaultShims()   // veilens FFI shims → headgate-mojo/lib (vault-run dlopen)
 
         // The streaming app server (built on-device against headgate). Best-effort:
         // skips cleanly until veilensapp/app publishes a release to download.
