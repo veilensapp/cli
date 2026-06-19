@@ -986,12 +986,16 @@ public final class Bootstrapper: ObservableObject {
         // headgate-engine/. Same -I set headgate's own server build uses, plus
         // headgate/src.
         let inc = [
+            "-I", "src",  // the bundle's own modules (events.mojo, imported by ws_server)
             "-I", headgateDir.appendingPathComponent("src").path,
             "-I", headgateRoot.appendingPathComponent("flare").path,
             "-I", headgateRoot.appendingPathComponent("json").path,
             "-I", headgateRoot.appendingPathComponent("jinja2.mojo/src").path,
         ]
         let env = headgateMojoEnv(python: python)
+        // `mojo build -o build/…` won't create the output dir, and the app bundle
+        // ships no build/ — make it (mirrors the pixi tasks' `mkdir -p build`).
+        try fm.createDirectory(at: appRoot.appendingPathComponent("build"), withIntermediateDirectories: true)
         try run(mojo, ["build", "src/ws_server.mojo"] + inc + ["-o", "build/veilens-ws"],
                 cwd: appRoot, env: env)
         try run(mojo, ["build", "src/server.mojo"] + inc + ["-o", "build/veilens-server"],
@@ -1367,12 +1371,10 @@ public final class Bootstrapper: ObservableObject {
         // skips cleanly until veilensapp/app publishes a release to download.
         set("Refreshing veilens app server…")
         try? FileManager.default.removeItem(at: appRoot)
-        do {
-            try await installAppServer()
-        } catch {
-            set("• app server not refreshed: \(humanError(error))")
-            vlog("app server refresh skipped: \(humanError(error))")
-        }
+        // Surface failures: a real build error must fail the update, not be
+        // swallowed (otherwise `veilens update` falsely reports success). The
+        // bundle is published now, so there's no "not yet released" case to skip.
+        try await installAppServer()
 
         vlog("update complete")
     }
