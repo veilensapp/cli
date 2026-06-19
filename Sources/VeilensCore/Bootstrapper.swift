@@ -1126,9 +1126,46 @@ public final class Bootstrapper: ObservableObject {
         return script
     }
 
+    /// Cutover launcher (two local servers): veilens-server serves the web UI on
+    /// :10000, veilens-ws streams on :10001 — flare can't do both on one port. Both
+    /// run from the app bundle dir (so `./web/dist` resolves) with headgate's
+    /// toolchain env (CONDA_PREFIX + flare shims) + the vault resolution env. Opens
+    /// the browser; kills the background WS server when the foreground static
+    /// server exits.
+    public func writeVeilensAppScript(vaultDir dir: String) throws -> URL {
+        let mojoBin = headgateMojoPrefix.appendingPathComponent("bin").path
+        let modularHome = headgateMojoPrefix.appendingPathComponent("share/max").path
+        let script = support.appendingPathComponent("run-veilens-app.sh")
+        let body = """
+        #!/bin/bash
+        cd '\(appRoot.path)'
+        export CONDA_PREFIX='\(headgateMojoPrefix.path)'
+        export MODULAR_HOME='\(modularHome)'
+        export PATH='\(mojoBin)':"$PATH"
+        [ -f /etc/ssl/cert.pem ] && export SSL_CERT_FILE='/etc/ssl/cert.pem'
+        export HEADGATE_VAULT_DIR='\(dir)'
+        export VEILENS_VAULT='\(dir)'
+        # The vault tools (search/ask_local) hit the combined inference server over
+        # loopback — embeddings + chat on one port (:8000).
+        export VEILENS_EMBED_URL='http://127.0.0.1:8000/v1'
+        export VEILENS_LOCAL_URL='http://127.0.0.1:8000/v1'
+        # veilens-ws compiles the generated vault program against the veilens sources.
+        export HEADGATE_VEILENS='\(veilensDir.path)'
+        # Streaming backend on :10001, static UI on :10000. Kill the WS server when
+        # the foreground static server exits (Ctrl-C ends both).
+        ./build/veilens-ws & WS_PID=$!
+        trap 'kill $WS_PID 2>/dev/null' EXIT
+        ( sleep 1.5 && open 'http://localhost:10000' ) >/dev/null 2>&1 &
+        ./build/veilens-server
+        """
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return script
+    }
+
     /// `millrace veilens start` / menu "Open vault chat…": ensure the combined
-    /// server is running (launchd), then start the headgate web chat in VAULT mode
-    /// and open http://localhost:10000. The script opens the browser itself.
+    /// server is running (launchd), then start the vault chat in a new Terminal and
+    /// open http://localhost:10000. The script opens the browser itself.
     public func startVaultChat(vaultDir dir: String) async throws {
         // 0. The vault dir must exist before headgate/veilens's `manifest` runs
         //    over it (a clean machine has no vault dir yet).
@@ -1139,8 +1176,11 @@ public final class Bootstrapper: ObservableObject {
             refreshServerRunning()
             if !serverRunning { try startServer() }
         }
-        // 2. Start the headgate vault web chat in a new Terminal (it opens :10000).
-        let script = try writeVeilensWebScript(vaultDir: dir)
+        // 2. Start the vault chat in a new Terminal (it opens :10000). Prefer the
+        //    app server (streaming UI) when installed; else the headgate web UI.
+        let script = isAppServerInstalled
+            ? try writeVeilensAppScript(vaultDir: dir)
+            : try writeVeilensWebScript(vaultDir: dir)
         let cmd = "'\(script.path)'"
         try run("/usr/bin/osascript",
                 ["-e", "tell application \"Terminal\" to activate",
