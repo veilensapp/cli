@@ -1183,9 +1183,15 @@ public final class Bootstrapper: ObservableObject {
         let modularHome = headgateMojoPrefix.appendingPathComponent("share/max").path
         let serverLog = veilensLogDir.appendingPathComponent("server.log").path
         let script = support.appendingPathComponent("run-veilens-app.sh")
+        let serverBin = appRoot.appendingPathComponent("build/veilens-server").path
+        let wsBin = appRoot.appendingPathComponent("build/veilens-ws").path
         let body = """
         #!/bin/bash
-        cd '\(appRoot.path)'
+        # Run from the headgate engine dir: the vault orchestrator reads its
+        # sandbox/*.sb.template profiles relative to cwd (the same dir the `ask`
+        # launcher uses). The UI is served via VEILENS_WEB_DIR (absolute), and the
+        # server binaries are referenced by absolute path, so cwd can be headgate's.
+        cd '\(headgateDir.path)'
         export CONDA_PREFIX='\(headgateMojoPrefix.path)'
         export MODULAR_HOME='\(modularHome)'
         export PATH='\(mojoBin)':"$PATH"
@@ -1207,8 +1213,8 @@ public final class Bootstrapper: ObservableObject {
         LOG='\(serverLog)'
         mkdir -p "$(dirname "$LOG")"
         echo "=== veilens app servers starting $(date) ===" >> "$LOG"
-        nohup ./build/veilens-server >> "$LOG" 2>&1 &
-        nohup ./build/veilens-ws     >> "$LOG" 2>&1 &
+        nohup '\(serverBin)' >> "$LOG" 2>&1 &
+        nohup '\(wsBin)'     >> "$LOG" 2>&1 &
         ( sleep 1.5 && open 'http://localhost:10000' ) >/dev/null 2>&1 &
         """
         try body.write(to: script, atomically: true, encoding: .utf8)
