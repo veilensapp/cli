@@ -290,6 +290,25 @@ public final class Bootstrapper: ObservableObject {
         return f.string(from: Date())
     }
 
+    // ── toolchain freshness ─────────────────────────────────────────────────────
+    /// True if the Mojo toolchain at `prefix` is absent OR not the pinned `version`
+    /// (recorded in a .mojo-version marker). Presence alone isn't enough: a stale
+    /// nightly kept across a version bump can segfault on a newer macOS — so a
+    /// version mismatch forces a re-download.
+    private func mojoToolchainStale(_ prefix: URL, _ version: String) -> Bool {
+        guard FileManager.default.isExecutableFile(
+            atPath: prefix.appendingPathComponent("bin/mojo").path) else { return true }
+        let have = (try? String(contentsOf: prefix.appendingPathComponent(".mojo-version"),
+                                 encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return have != version
+    }
+
+    private func recordMojoVersion(_ prefix: URL, _ version: String) {
+        try? version.write(to: prefix.appendingPathComponent(".mojo-version"),
+                           atomically: true, encoding: .utf8)
+    }
+
     // ── step 1: install server (+ weights) ──────────────────────────────────────
     /// Menu-app entry point: fire-and-forget, drives `phase`. The CLI calls the
     /// throwing `installServer()` directly.
@@ -310,7 +329,8 @@ public final class Bootstrapper: ObservableObject {
         // present → nothing to do. Otherwise fall through; the steps below each
         // skip what's already done (toolchain, weights), so a partial install
         // resumes (e.g. just the missing embedding weights).
-        if isServerInstalled && weightsPresent && embedWeightsPresent {
+        if isServerInstalled && weightsPresent && embedWeightsPresent
+            && !mojoToolchainStale(mojoPrefix, Self.mojoVersion) {
             set("millrace already installed — skipping")
             return
         }
@@ -320,13 +340,16 @@ public final class Bootstrapper: ObservableObject {
         }
         logHeader("Install server")
 
-        if !fm.fileExists(atPath: mojoPrefix.appendingPathComponent("bin/mojo").path) {
+        if mojoToolchainStale(mojoPrefix, Self.mojoVersion) {
             set("Downloading Mojo compiler for millrace (~70 MB)…")
+            try? fm.removeItem(at: mojoPrefix)   // clear any stale nightly
+            try fm.createDirectory(at: mojoPrefix, withIntermediateDirectories: true)
             let compiler = try await download(mojoCompilerURL, name: "mojo-compiler.conda")
             set("Extracting Mojo…")
             try extractConda(compiler, into: mojoPrefix)
             let py = try await download(mojoPythonURL, name: "mojo-python.conda")
             try extractConda(py, into: mojoPrefix)
+            recordMojoVersion(mojoPrefix, Self.mojoVersion)
         }
         try relocateMojoPrefix(mojoPrefix)   // rewrite modular.cfg's baked placeholder prefix
 
@@ -670,7 +693,8 @@ public final class Bootstrapper: ObservableObject {
     /// vendored flare/json/jinja2.mojo + prebuilt FFI shims.
     public func installHeadgateEngine() async throws {
         // Idempotent: skip the whole download+build if the binary is already there.
-        if isHeadgateInstalled {
+        if isHeadgateInstalled
+            && !mojoToolchainStale(headgateMojoPrefix, Self.headgateMojoVersion) {
             set("headgate already installed — skipping")
             return
         }
@@ -681,13 +705,16 @@ public final class Bootstrapper: ObservableObject {
         logHeader("Install headgate")
 
         // 1. Mojo toolchain (headgate's nightly — distinct from the engine's).
-        if !fm.fileExists(atPath: headgateMojoPrefix.appendingPathComponent("bin/mojo").path) {
+        if mojoToolchainStale(headgateMojoPrefix, Self.headgateMojoVersion) {
             set("Downloading Mojo compiler for headgate (~70 MB)…")
+            try? fm.removeItem(at: headgateMojoPrefix)   // clear any stale nightly
+            try fm.createDirectory(at: headgateMojoPrefix, withIntermediateDirectories: true)
             let compiler = try await download(headgateMojoCompilerURL, name: "headgate-mojo-compiler.conda")
             set("Extracting Mojo…")
             try extractConda(compiler, into: headgateMojoPrefix)
             let py = try await download(headgateMojoPythonURL, name: "headgate-mojo-python.conda")
             try extractConda(py, into: headgateMojoPrefix)
+            recordMojoVersion(headgateMojoPrefix, Self.headgateMojoVersion)
         }
         try relocateMojoPrefix(headgateMojoPrefix)
 
@@ -878,7 +905,8 @@ public final class Bootstrapper: ObservableObject {
     /// zlib + prebuilt FFI shims, so the build uses `-I` includes + installs shims.
     public func installVeilensEngine() async throws {
         // Idempotent: skip the whole download+build if the binary is already there.
-        if isVeilensInstalled {
+        if isVeilensInstalled
+            && !mojoToolchainStale(veilensMojoPrefix, Self.headgateMojoVersion) {
             set("veilens already installed — skipping")
             return
         }
@@ -889,13 +917,16 @@ public final class Bootstrapper: ObservableObject {
         logHeader("Install veilens")
 
         // 1. Mojo toolchain (same nightly as headgate).
-        if !fm.fileExists(atPath: veilensMojoPrefix.appendingPathComponent("bin/mojo").path) {
+        if mojoToolchainStale(veilensMojoPrefix, Self.headgateMojoVersion) {
             set("Downloading Mojo compiler for veilens (~70 MB)…")
+            try? fm.removeItem(at: veilensMojoPrefix)   // clear any stale nightly
+            try fm.createDirectory(at: veilensMojoPrefix, withIntermediateDirectories: true)
             let compiler = try await download(veilensMojoCompilerURL, name: "veilens-mojo-compiler.conda")
             set("Extracting Mojo…")
             try extractConda(compiler, into: veilensMojoPrefix)
             let py = try await download(veilensMojoPythonURL, name: "veilens-mojo-python.conda")
             try extractConda(py, into: veilensMojoPrefix)
+            recordMojoVersion(veilensMojoPrefix, Self.headgateMojoVersion)
         }
         try relocateMojoPrefix(veilensMojoPrefix)
 
