@@ -97,6 +97,7 @@ struct Status: AsyncParsableCommand {
         print("embeddings: \(mark(boot.embedWeightsPresent))")
         print("headgate:   \(mark(boot.isHeadgateInstalled))")
         print("veilens:    \(mark(boot.isVeilensInstalled))")
+        print("app server: \(mark(boot.isAppServerInstalled))")
     }
 }
 

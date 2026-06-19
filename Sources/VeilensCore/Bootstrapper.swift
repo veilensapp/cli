@@ -125,6 +125,16 @@ public final class Bootstrapper: ObservableObject {
     /// The built veilens binary is present.
     public var isVeilensInstalled: Bool { FileManager.default.isExecutableFile(atPath: veilensBin.path) }
 
+    // ── app server (the streaming WS backend, from veilensapp/app) ──────────────
+    // Built ON-DEVICE against the headgate engine tree, reusing headgate's Mojo
+    // toolchain + flare shims — so no new toolchain. See app/server/CUTOVER.md.
+    private let appZipURL =
+        URL(string: "https://github.com/veilensapp/app/releases/latest/download/veilens-app.zip")!
+    private var appRoot: URL { support.appendingPathComponent("app", isDirectory: true) }
+    private var appWsBin: URL { appRoot.appendingPathComponent("build/veilens-ws") }
+    /// The built streaming WS server is present.
+    public var isAppServerInstalled: Bool { FileManager.default.isExecutableFile(atPath: appWsBin.path) }
+
     // ── default config files (~/.config) ───────────────────────────────────────
     // Seeded with sensible defaults on install if absent, so a fresh setup has an
     // editable starting point. The engines read these (millrace = inference-server,
@@ -942,6 +952,52 @@ public final class Bootstrapper: ObservableObject {
         return env
     }
 
+    /// Download the veilens app bundle (veilensapp/app) and build the streaming WS
+    /// server (+ the unary HTTP server) ON-DEVICE against the already-installed
+    /// headgate engine tree — reusing headgate's Mojo toolchain + flare shims, so
+    /// no new toolchain. Requires the headgate engine (installHeadgateEngine).
+    public func installAppServer() async throws {
+        if isAppServerInstalled {
+            set("veilens app server already installed — skipping")
+            return
+        }
+        guard isHeadgateInstalled else {
+            throw BootstrapError.step("app server",
+                "headgate engine not installed — run `veilens install` first")
+        }
+        let fm = FileManager.default
+        try fm.createDirectory(at: appRoot, withIntermediateDirectories: true)
+        logHeader("Install veilens app server")
+
+        set("Downloading veilens app bundle…")
+        let zip = try await download(appZipURL, name: "veilens-app.zip")
+        set("Unpacking app bundle…")
+        try run("/usr/bin/unzip", ["-o", "-q", zip.path, "-d", appRoot.path])
+        guard fm.fileExists(atPath: appRoot.appendingPathComponent("src/ws_server.mojo").path) else {
+            throw BootstrapError.step("unpack", "veilens-app.zip missing src/ws_server.mojo")
+        }
+
+        set("Locating Python…")
+        let python = try findPython()
+        set("Building veilens app server (first run, ~1 min)…")
+        let mojo = headgateMojoPrefix.appendingPathComponent("bin/mojo").path
+        // Build against the installed headgate engine tree: the orchestrator
+        // (headgate/src) + the vendored flare/json/jinja2 siblings under
+        // headgate-engine/. Same -I set headgate's own server build uses, plus
+        // headgate/src.
+        let inc = [
+            "-I", headgateDir.appendingPathComponent("src").path,
+            "-I", headgateRoot.appendingPathComponent("flare").path,
+            "-I", headgateRoot.appendingPathComponent("json").path,
+            "-I", headgateRoot.appendingPathComponent("jinja2.mojo/src").path,
+        ]
+        let env = headgateMojoEnv(python: python)
+        try run(mojo, ["build", "src/ws_server.mojo"] + inc + ["-o", "build/veilens-ws"],
+                cwd: appRoot, env: env)
+        try run(mojo, ["build", "src/server.mojo"] + inc + ["-o", "build/veilens-server"],
+                cwd: appRoot, env: env)
+    }
+
     // ── veilens: start (open a ready-to-use Terminal) ───────────────────────────
     /// veilens is a one-shot vault CLI, so "start" opens a Terminal in the install
     /// dir with the toolchain env pre-set — the user runs e.g.
@@ -1266,6 +1322,17 @@ public final class Bootstrapper: ObservableObject {
         set("Refreshing veilens, the vault engine…")
         try? FileManager.default.removeItem(at: veilensRoot)
         try await installVeilensEngine()
+
+        // The streaming app server (built on-device against headgate). Best-effort:
+        // skips cleanly until veilensapp/app publishes a release to download.
+        set("Refreshing veilens app server…")
+        try? FileManager.default.removeItem(at: appRoot)
+        do {
+            try await installAppServer()
+        } catch {
+            set("• app server not refreshed: \(humanError(error))")
+            vlog("app server refresh skipped: \(humanError(error))")
+        }
 
         vlog("update complete")
     }
