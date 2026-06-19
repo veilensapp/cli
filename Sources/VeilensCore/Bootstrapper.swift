@@ -361,6 +361,7 @@ public final class Bootstrapper: ObservableObject {
         }
 
         ensureConfig(at: millraceConfigURL, Self.millraceConfigDefault)
+        await recordLatest("inference-server", repo: "millrace/inference-server")
     }
 
     // ── step 2: start / stop server (launchd LaunchAgent) ────────────────────────
@@ -722,6 +723,7 @@ public final class Bootstrapper: ObservableObject {
         //    unlike the always-serving server.
         try installHeadgateShims()
         ensureConfig(at: headgateConfigURL, Self.headgateConfigDefault)
+        await recordLatest("headgate", repo: "veilensapp/headgate")
     }
 
     /// Copy the bundled relocatable FFI shims (+ their dylib deps) into the headgate
@@ -924,6 +926,7 @@ public final class Bootstrapper: ObservableObject {
         //    `$CONDA_PREFIX/lib` lookup finds them at runtime (veilens runs WITH
         //    CONDA_PREFIX set via run-veilens.sh).
         try installVeilensShims()
+        await recordLatest("veilens", repo: "veilensapp/veilens")
     }
 
     /// Copy the bundled relocatable FFI shims (+ their dylib deps) into the veilens
@@ -1037,6 +1040,7 @@ public final class Bootstrapper: ObservableObject {
                 cwd: appRoot, env: env)
         try run(mojo, ["build", "src/server.mojo"] + inc + ["-o", "build/veilens-server"],
                 cwd: appRoot, env: env)
+        await recordLatest("app", repo: "veilensapp/app")
     }
 
     // ── veilens: start (open a ready-to-use Terminal) ───────────────────────────
@@ -1481,6 +1485,63 @@ public final class Bootstrapper: ObservableObject {
             vlog("brew upgrade (non-fatal): \(humanError(error))")
             set("• CLI not upgraded via Homebrew (already latest, or not a brew install)")
         }
+    }
+
+    // ── component versions ──────────────────────────────────────────────────────
+    // Each downloadable component records its installed release tag under
+    // support/versions/ at install time (resolved from the repo's releases/latest);
+    // `veilens version` and `veilens update` read them back. The CLI's own version
+    // comes from Homebrew.
+    private var versionsDir: URL { support.appendingPathComponent("versions", isDirectory: true) }
+
+    /// Resolve a repo's latest release tag from the GitHub API ("" on failure).
+    private func latestTag(_ repo: String) async -> String {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest")
+        else { return "" }
+        var req = URLRequest(url: url)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 8
+        guard let pair = try? await URLSession.shared.data(for: req),
+              (pair.1 as? HTTPURLResponse)?.statusCode == 200,
+              let s = String(data: pair.0, encoding: .utf8),
+              let r = s.range(of: "\"tag_name\":\"") else { return "" }
+        let rest = s[r.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return "" }
+        return String(rest[..<end])
+    }
+
+    /// Record `name`'s installed version (the repo's latest tag). Best-effort.
+    func recordLatest(_ name: String, repo: String) async {
+        let tag = await latestTag(repo)
+        guard !tag.isEmpty else { return }
+        try? FileManager.default.createDirectory(at: versionsDir, withIntermediateDirectories: true)
+        try? tag.write(to: versionsDir.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    private func readVersion(_ name: String) -> String {
+        (try? String(contentsOf: versionsDir.appendingPathComponent(name), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// The CLI's own version, from Homebrew ("" if not a brew install).
+    private func brewCliVersion() -> String {
+        guard let brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return "" }
+        guard let out = try? run(brew, ["list", "--versions", "veilensapp/tap/veilens"]) else { return "" }
+        let toks = out.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init)
+        return toks.count >= 2 ? "v" + toks.last! : ""
+    }
+
+    /// Installed versions of veilens + its components (label, version) for display.
+    public func componentVersions() -> [(String, String)] {
+        func shown(_ s: String) -> String { s.isEmpty ? "—" : s }
+        return [
+            ("cli (veilens)", shown(brewCliVersion())),
+            ("inference server", shown(readVersion("inference-server"))),
+            ("headgate", shown(readVersion("headgate"))),
+            ("veilens engine", shown(readVersion("veilens"))),
+            ("app server", shown(readVersion("app"))),
+        ]
     }
 
     // ── phase / progress sink ───────────────────────────────────────────────────

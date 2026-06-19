@@ -15,7 +15,7 @@ struct Veilens: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "veilens",
         abstract: "The veilens personal data vault — install, start, stop, index, and ask.",
-        subcommands: [Install.self, Update.self, Start.self, Stop.self, Status.self, Index.self, Ask.self]
+        subcommands: [Install.self, Update.self, Version.self, Start.self, Stop.self, Status.self, Index.self, Ask.self]
     )
 }
 
@@ -51,8 +51,29 @@ struct Update: AsyncParsableCommand {
 
     @MainActor func run() async throws {
         let boot = streaming()
+        print("Versions before update:")
+        printVersions(boot.componentVersions())
+        print("")
         try await boot.selfUpdate(updateCLI: !skipCli)
+        print("\nVersions after update:")
+        printVersions(boot.componentVersions())
         print("✓ veilens up to date")
+    }
+}
+
+// ── veilens version ────────────────────────────────────────────────────────────
+struct Version: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Show the installed versions of veilens and its components.")
+    @MainActor func run() async throws {
+        printVersions(Bootstrapper().componentVersions())
+    }
+}
+
+/// Print a (component, version) list aligned for the console.
+@MainActor private func printVersions(_ versions: [(String, String)]) {
+    for (name, ver) in versions {
+        print("  " + name.padding(toLength: 18, withPad: " ", startingAt: 0) + ver)
     }
 }
 
