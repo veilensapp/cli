@@ -1198,6 +1198,8 @@ public final class Bootstrapper: ObservableObject {
         export VEILENS_LOCAL_URL='http://127.0.0.1:8000/v1'
         # veilens-ws compiles the generated vault program against the veilens sources.
         export HEADGATE_VEILENS='\(veilensDir.path)'
+        # Serve the built UI by ABSOLUTE path so it doesn't depend on cwd.
+        export VEILENS_WEB_DIR='\(appRoot.appendingPathComponent("web/dist").path)'
         # Run both servers detached in the BACKGROUND (no Terminal) — static UI on
         # :10000, streaming WS on :10001 — logging to the veilens server log. nohup
         # so they survive this launcher (and the CLI) exiting; `veilens stop` reaps
@@ -1227,6 +1229,10 @@ public final class Bootstrapper: ObservableObject {
             refreshServerRunning()
             if !serverRunning { try startServer() }
         }
+        // Reap any stale servers holding :10000/:10001 (a prior `start`, or the
+        // legacy headgate web server) so the fresh ones can bind cleanly.
+        _ = stopAppServer()
+        _ = stopHeadgateWeb()
         // 2. Start the vault chat. With the app server, the launcher spawns both
         //    servers detached in the background and opens the browser, then exits —
         //    no Terminal window (clients are web/mobile). Fall back to the legacy
